@@ -21,6 +21,12 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
+# Windows에서 콘솔/리다이렉트 출력이 CP949 등으로 잡혀 한글 로그가 깨지는 것을 방지.
+if sys.stdout.encoding != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+if sys.stderr.encoding != "utf-8":
+    sys.stderr.reconfigure(encoding="utf-8")
+
 # 리소스 고갈(포트 부족 등) 같은 일시적 네트워크 오류. 지수 백오프로 재시도한다.
 _TRANSIENT_NETWORK_ERRORS = (OSError, ConnectionError, TimeoutError, ssl.SSLError, http.client.HTTPException)
 
@@ -73,12 +79,19 @@ def _get_with_retry(url: str, params: dict, max_retries: int = 5, timeout: int =
 
 
 def _execute_with_retry(request, max_retries: int = 5):
-    """Google API request 실행. 5xx/일시적 네트워크 오류는 지수 백오프로 재시도."""
+    """Google API request 실행. 429(쿼터 초과)/5xx/일시적 네트워크 오류는 지수 백오프로 재시도.
+    429는 분당 쿼터가 리셋될 때까지 기다려야 하므로 더 길게 대기한다."""
     retry = 0
     while True:
         try:
             return request.execute()
         except HttpError as e:
+            if e.resp.status == 429 and retry < max_retries:
+                wait = 10 * (2 ** retry)
+                print(f"    API 쿼터 초과(429), {wait}초 후 재시도... ({retry + 1}/{max_retries})")
+                time.sleep(wait)
+                retry += 1
+                continue
             if e.resp.status in (500, 502, 503, 504) and retry < max_retries:
                 wait = 2 ** retry
                 print(f"    API 오류({e.resp.status}), {wait}초 후 재시도... ({retry + 1}/{max_retries})")
@@ -537,8 +550,10 @@ def _reset_row_format(sheets_service, spreadsheet_id: str, start_row_index: int,
     ))
 
 
-def upsert_sheet_rows(sheets_service, spreadsheet_id: str, rows: List[Dict]):
-    """rows의 각 항목을 유튜브 링크(video ID) 기준으로 upsert."""
+def build_id_to_row_cache(sheets_service, spreadsheet_id: str) -> Dict[str, int]:
+    """시트 전체를 한 번만 읽어 {video_id: row_number} 캐시를 만든다.
+    영상마다 매번 시트를 새로 읽으면 Sheets API 읽기 쿼터(분당 요청 수)를 금방 초과하므로,
+    호출자가 이 캐시를 만들어 upsert_sheet_rows()에 계속 넘겨써야 한다."""
     result = _execute_with_retry(sheets_service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id, range="A2:H"
     ))
@@ -550,9 +565,16 @@ def upsert_sheet_rows(sheets_service, spreadsheet_id: str, rows: List[Dict]):
             vid = _extract_video_id(row[6])
             if vid:
                 id_to_row[vid] = idx + 2  # 1-based, header가 1행
+    return id_to_row
 
+
+def upsert_sheet_rows(sheets_service, spreadsheet_id: str, rows: List[Dict], id_to_row: Dict[str, int]):
+    """rows의 각 항목을 유튜브 링크(video ID) 기준으로 upsert.
+    id_to_row: build_id_to_row_cache()로 만든 캐시. 시트를 다시 읽지 않고 이 캐시만 참조하며,
+    새로 추가된 행은 이 함수가 캐시에 반영한다."""
     update_data = []
     append_rows = []
+    appended_vids = []
     for r in rows:
         vid = _extract_video_id(r["youtube_url"])
         like = r.get("like_count")
@@ -575,6 +597,7 @@ def upsert_sheet_rows(sheets_service, spreadsheet_id: str, rows: List[Dict]):
                 r["view_count"], like_val, r["comment_count"],
                 r["youtube_url"], r.get("drive_url", ""),
             ])
+            appended_vids.append(vid)
 
     if update_data:
         _execute_with_retry(sheets_service.spreadsheets().values().batchUpdate(
@@ -592,6 +615,8 @@ def upsert_sheet_rows(sheets_service, spreadsheet_id: str, rows: List[Dict]):
         # 새 행이 삽입 시 위 행의 서식(굵게/회색)을 상속받으므로 기본 서식으로 되돌린다.
         start_row_index, end_row_index = _parse_row_bounds(response["updates"]["updatedRange"])
         _reset_row_format(sheets_service, spreadsheet_id, start_row_index, end_row_index)
+        for offset, vid in enumerate(appended_vids):
+            id_to_row[vid] = start_row_index + 1 + offset  # 1-based row number
 
 
 def update_sheet_stats(sheets_service, spreadsheet_id: str, stats: Dict[str, Dict]) -> int:
@@ -660,10 +685,13 @@ def _format_date(value: Optional[str]) -> str:
 # main
 # ---------------------------------------------------------------------------
 
-def _try_upsert(sheets_service, spreadsheet_id: str, row: Dict, filename: str, failed: List[str]) -> bool:
+def _try_upsert(
+    sheets_service, spreadsheet_id: str, row: Dict, filename: str, failed: List[str],
+    id_to_row: Dict[str, int],
+) -> bool:
     """upsert_sheet_rows 실패(네트워크 오류 등)가 전체 배치를 중단시키지 않도록 격리."""
     try:
-        upsert_sheet_rows(sheets_service, spreadsheet_id, [row])
+        upsert_sheet_rows(sheets_service, spreadsheet_id, [row], id_to_row)
         return True
     except Exception as e:
         print(f"  [실패] {filename}: 시트 갱신 실패 - {e}")
@@ -694,6 +722,7 @@ def run_download_mode(args, mode: str, start: int, end: Optional[int]):
     existing = list_existing_files(drive_service, folder_id)
     spreadsheet_id, sheet_url = get_or_create_sheet(drive_service, sheets_service, args.sheet_name)
     init_sheet_header(sheets_service, spreadsheet_id)
+    id_to_row = build_id_to_row_cache(sheets_service, spreadsheet_id)
 
     print("[4/4] 다운로드 → 업로드 시작")
     uploaded, skipped, failed = 0, 0, []
@@ -714,7 +743,7 @@ def run_download_mode(args, mode: str, start: int, end: Optional[int]):
                     "comment_count": video["comment_count"],
                     "youtube_url": youtube_url,
                     "drive_url": drive_url,
-                }, filename, failed):
+                }, filename, failed, id_to_row):
                     skipped += 1
                     print(f"  [건너뜀] {filename}")
                 continue
@@ -758,7 +787,7 @@ def run_download_mode(args, mode: str, start: int, end: Optional[int]):
                 "comment_count": video["comment_count"],
                 "youtube_url": youtube_url,
                 "drive_url": drive_url,
-            }, filename, failed):
+            }, filename, failed, id_to_row):
                 uploaded += 1
                 print(f"  [완료] {filename}")
 
