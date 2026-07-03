@@ -2,9 +2,11 @@
 """YouTube Shorts를 다운로드하여 Google Drive에 업로드하고 Google Sheets에 현황을 기록하는 CLI."""
 
 import argparse
+import http.client
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -18,6 +20,9 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
+
+# 리소스 고갈(포트 부족 등) 같은 일시적 네트워크 오류. 지수 백오프로 재시도한다.
+_TRANSIENT_NETWORK_ERRORS = (OSError, ConnectionError, TimeoutError, ssl.SSLError, http.client.HTTPException)
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
@@ -42,6 +47,53 @@ FORMAT_SELECTOR = (
 SHEET_HEADER = [
     "번호", "영상 제목", "업로드 날짜", "조회수", "좋아요 수", "댓글 수", "유튜브 링크", "드라이브 링크",
 ]
+
+
+def _get_with_retry(url: str, params: dict, max_retries: int = 5, timeout: int = 30):
+    """requests.get 실행. 5xx/일시적 네트워크 오류는 지수 백오프로 재시도."""
+    retry = 0
+    while True:
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            if resp.status_code in (500, 502, 503, 504) and retry < max_retries:
+                wait = 2 ** retry
+                print(f"    API 오류({resp.status_code}), {wait}초 후 재시도... ({retry + 1}/{max_retries})")
+                time.sleep(wait)
+                retry += 1
+                continue
+            return resp
+        except (requests.exceptions.RequestException, *_TRANSIENT_NETWORK_ERRORS) as e:
+            if retry < max_retries:
+                wait = 2 ** retry
+                print(f"    네트워크 오류({e}), {wait}초 후 재시도... ({retry + 1}/{max_retries})")
+                time.sleep(wait)
+                retry += 1
+                continue
+            raise
+
+
+def _execute_with_retry(request, max_retries: int = 5):
+    """Google API request 실행. 5xx/일시적 네트워크 오류는 지수 백오프로 재시도."""
+    retry = 0
+    while True:
+        try:
+            return request.execute()
+        except HttpError as e:
+            if e.resp.status in (500, 502, 503, 504) and retry < max_retries:
+                wait = 2 ** retry
+                print(f"    API 오류({e.resp.status}), {wait}초 후 재시도... ({retry + 1}/{max_retries})")
+                time.sleep(wait)
+                retry += 1
+                continue
+            raise
+        except _TRANSIENT_NETWORK_ERRORS as e:
+            if retry < max_retries:
+                wait = 2 ** retry
+                print(f"    네트워크 오류({e}), {wait}초 후 재시도... ({retry + 1}/{max_retries})")
+                time.sleep(wait)
+                retry += 1
+                continue
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +175,7 @@ def fetch_video_stats(video_ids: List[str], api_key: str) -> Dict[str, Dict]:
             "id": ",".join(batch),
             "key": api_key,
         }
-        resp = requests.get(YOUTUBE_API_BASE, params=params, timeout=30)
+        resp = _get_with_retry(YOUTUBE_API_BASE, params)
 
         if resp.status_code == 403:
             reason = ""
@@ -214,7 +266,7 @@ def get_or_create_folder(service, folder_name: str) -> str:
         "mimeType = 'application/vnd.google-apps.folder' and "
         "'root' in parents and trashed = false"
     )
-    res = service.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
+    res = _execute_with_retry(service.files().list(q=query, spaces="drive", fields="files(id, name)"))
     files = res.get("files", [])
     if files:
         return files[0]["id"]
@@ -224,7 +276,7 @@ def get_or_create_folder(service, folder_name: str) -> str:
         "mimeType": "application/vnd.google-apps.folder",
         "parents": ["root"],
     }
-    folder = service.files().create(body=metadata, fields="id").execute()
+    folder = _execute_with_retry(service.files().create(body=metadata, fields="id"))
     return folder["id"]
 
 
@@ -234,12 +286,12 @@ def list_existing_files(service, folder_id: str) -> Dict[str, str]:
     files: Dict[str, str] = {}
     page_token = None
     while True:
-        res = service.files().list(
+        res = _execute_with_retry(service.files().list(
             q=f"'{folder_id}' in parents and trashed = false",
             spaces="drive",
             fields="nextPageToken, files(id, name, properties)",
             pageToken=page_token,
-        ).execute()
+        ))
         for f in res.get("files", []):
             vid = (f.get("properties") or {}).get("video_id")
             if vid:
@@ -272,6 +324,14 @@ def upload_file(
             if e.resp.status in (500, 502, 503, 504) and retry < max_retries:
                 wait = 2 ** retry
                 print(f"    업로드 오류({e.resp.status}), {wait}초 후 재시도... ({retry + 1}/{max_retries})")
+                time.sleep(wait)
+                retry += 1
+                continue
+            raise
+        except _TRANSIENT_NETWORK_ERRORS as e:
+            if retry < max_retries:
+                wait = 2 ** retry
+                print(f"    네트워크 오류({e}), {wait}초 후 재시도... ({retry + 1}/{max_retries})")
                 time.sleep(wait)
                 retry += 1
                 continue
@@ -350,14 +410,14 @@ def get_or_create_sheet(drive_service, sheets_service, sheet_name: str) -> Tuple
         f"name = '{_escape_query_value(sheet_name)}' and "
         "mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false"
     )
-    res = drive_service.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
+    res = _execute_with_retry(drive_service.files().list(q=query, spaces="drive", fields="files(id, name)"))
     files = res.get("files", [])
     if files:
         spreadsheet_id = files[0]["id"]
     else:
-        spreadsheet = sheets_service.spreadsheets().create(
+        spreadsheet = _execute_with_retry(sheets_service.spreadsheets().create(
             body={"properties": {"title": sheet_name}}, fields="spreadsheetId"
-        ).execute()
+        ))
         spreadsheet_id = spreadsheet["spreadsheetId"]
 
     sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
@@ -371,19 +431,19 @@ FILTER_END_COL = SHEET_HEADER.index("댓글 수") + 1
 def init_sheet_header(sheets_service, spreadsheet_id: str):
     """시트 1행에 헤더 작성 (없을 때만). 헤더 서식, 헤더 행 고정,
     영상 제목~댓글 수 구간에 정렬/필터 화살표를 함께 설정한다."""
-    result = sheets_service.spreadsheets().values().get(
+    result = _execute_with_retry(sheets_service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id, range="A1:H1"
-    ).execute()
+    ))
     existing = result.get("values", [])
     if existing and existing[0]:
         return
 
-    sheets_service.spreadsheets().values().update(
+    _execute_with_retry(sheets_service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id, range="A1:H1",
         valueInputOption="RAW", body={"values": [SHEET_HEADER]},
-    ).execute()
+    ))
 
-    sheets_service.spreadsheets().batchUpdate(
+    _execute_with_retry(sheets_service.spreadsheets().batchUpdate(
         spreadsheetId=spreadsheet_id,
         body={
             "requests": [
@@ -425,7 +485,7 @@ def init_sheet_header(sheets_service, spreadsheet_id: str):
                 },
             ]
         },
-    ).execute()
+    ))
 
 
 def _extract_video_id(youtube_url: str) -> Optional[str]:
@@ -451,7 +511,7 @@ def _parse_row_bounds(a1_range: str) -> Tuple[int, int]:
 
 def _reset_row_format(sheets_service, spreadsheet_id: str, start_row_index: int, end_row_index: int):
     """새로 추가된 행이 헤더 서식(굵게/회색)을 상속받지 않도록 기본 서식으로 재설정."""
-    sheets_service.spreadsheets().batchUpdate(
+    _execute_with_retry(sheets_service.spreadsheets().batchUpdate(
         spreadsheetId=spreadsheet_id,
         body={
             "requests": [{
@@ -474,14 +534,14 @@ def _reset_row_format(sheets_service, spreadsheet_id: str, start_row_index: int,
                 }
             }]
         },
-    ).execute()
+    ))
 
 
 def upsert_sheet_rows(sheets_service, spreadsheet_id: str, rows: List[Dict]):
     """rows의 각 항목을 유튜브 링크(video ID) 기준으로 upsert."""
-    result = sheets_service.spreadsheets().values().get(
+    result = _execute_with_retry(sheets_service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id, range="A2:H"
-    ).execute()
+    ))
     existing_rows = result.get("values", [])
 
     id_to_row = {}
@@ -517,18 +577,18 @@ def upsert_sheet_rows(sheets_service, spreadsheet_id: str, rows: List[Dict]):
             ])
 
     if update_data:
-        sheets_service.spreadsheets().values().batchUpdate(
+        _execute_with_retry(sheets_service.spreadsheets().values().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"valueInputOption": "RAW", "data": update_data},
-        ).execute()
+        ))
 
     if append_rows:
         # 번호 열의 "=ROW()-1" 수식이 평가되도록 USER_ENTERED 사용.
-        response = sheets_service.spreadsheets().values().append(
+        response = _execute_with_retry(sheets_service.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id, range="A1:H1",
             valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
             body={"values": append_rows},
-        ).execute()
+        ))
         # 새 행이 삽입 시 위 행의 서식(굵게/회색)을 상속받으므로 기본 서식으로 되돌린다.
         start_row_index, end_row_index = _parse_row_bounds(response["updates"]["updatedRange"])
         _reset_row_format(sheets_service, spreadsheet_id, start_row_index, end_row_index)
@@ -536,9 +596,9 @@ def upsert_sheet_rows(sheets_service, spreadsheet_id: str, rows: List[Dict]):
 
 def update_sheet_stats(sheets_service, spreadsheet_id: str, stats: Dict[str, Dict]) -> int:
     """--update-sheet 모드에서 사용. 조회수/좋아요/댓글수 셀만 업데이트."""
-    result = sheets_service.spreadsheets().values().get(
+    result = _execute_with_retry(sheets_service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id, range="A2:H"
-    ).execute()
+    ))
     existing_rows = result.get("values", [])
 
     update_data = []
@@ -560,10 +620,10 @@ def update_sheet_stats(sheets_service, spreadsheet_id: str, stats: Dict[str, Dic
         updated += 1
 
     if update_data:
-        sheets_service.spreadsheets().values().batchUpdate(
+        _execute_with_retry(sheets_service.spreadsheets().values().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"valueInputOption": "RAW", "data": update_data},
-        ).execute()
+        ))
     return updated
 
 
@@ -600,6 +660,17 @@ def _format_date(value: Optional[str]) -> str:
 # main
 # ---------------------------------------------------------------------------
 
+def _try_upsert(sheets_service, spreadsheet_id: str, row: Dict, filename: str, failed: List[str]) -> bool:
+    """upsert_sheet_rows 실패(네트워크 오류 등)가 전체 배치를 중단시키지 않도록 격리."""
+    try:
+        upsert_sheet_rows(sheets_service, spreadsheet_id, [row])
+        return True
+    except Exception as e:
+        print(f"  [실패] {filename}: 시트 갱신 실패 - {e}")
+        failed.append(f"{filename}: 시트 갱신 실패 - {e}")
+        return False
+
+
 def run_download_mode(args, mode: str, start: int, end: Optional[int]):
     ffmpeg_bin = args.ffmpeg_path
     ffmpeg_exe = os.path.join(ffmpeg_bin, "ffmpeg") if ffmpeg_bin else "ffmpeg"
@@ -635,7 +706,7 @@ def run_download_mode(args, mode: str, start: int, end: Optional[int]):
 
             if video["id"] in existing:
                 drive_url = f"https://drive.google.com/file/d/{existing[video['id']]}/view"
-                upsert_sheet_rows(sheets_service, spreadsheet_id, [{
+                if _try_upsert(sheets_service, spreadsheet_id, {
                     "title": video["title"],
                     "published_at": published_at,
                     "view_count": video["view_count"],
@@ -643,9 +714,9 @@ def run_download_mode(args, mode: str, start: int, end: Optional[int]):
                     "comment_count": video["comment_count"],
                     "youtube_url": youtube_url,
                     "drive_url": drive_url,
-                }])
-                skipped += 1
-                print(f"  [건너뜀] {filename}")
+                }, filename, failed):
+                    skipped += 1
+                    print(f"  [건너뜀] {filename}")
                 continue
 
             raw_path = os.path.join(tmp_dir, f"raw_{video['id']}.mp4")
@@ -679,7 +750,7 @@ def run_download_mode(args, mode: str, start: int, end: Optional[int]):
             drive_url = f"https://drive.google.com/file/d/{file_id}/view"
             os.remove(upload_path)
 
-            upsert_sheet_rows(sheets_service, spreadsheet_id, [{
+            if _try_upsert(sheets_service, spreadsheet_id, {
                 "title": video["title"],
                 "published_at": published_at,
                 "view_count": video["view_count"],
@@ -687,9 +758,9 @@ def run_download_mode(args, mode: str, start: int, end: Optional[int]):
                 "comment_count": video["comment_count"],
                 "youtube_url": youtube_url,
                 "drive_url": drive_url,
-            }])
-            uploaded += 1
-            print(f"  [완료] {filename}")
+            }, filename, failed):
+                uploaded += 1
+                print(f"  [완료] {filename}")
 
     print(f"완료. 업로드: {uploaded}개 / 건너뜀: {skipped}개 / 실패: {len(failed)}개")
     if failed:
@@ -706,16 +777,16 @@ def run_update_sheet_mode(args):
         f"name = '{_escape_query_value(args.update_sheet)}' and "
         "mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false"
     )
-    res = drive_service.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
+    res = _execute_with_retry(drive_service.files().list(q=query, spaces="drive", fields="files(id, name)"))
     files = res.get("files", [])
     if not files:
         print(f"오류: '{args.update_sheet}' 이름의 시트를 찾을 수 없습니다.")
         sys.exit(1)
     spreadsheet_id = files[0]["id"]
 
-    result = sheets_service.spreadsheets().values().get(
+    result = _execute_with_retry(sheets_service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id, range="A2:H"
-    ).execute()
+    ))
     rows = result.get("values", [])
     video_ids = []
     for row in rows:
