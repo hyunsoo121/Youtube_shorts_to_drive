@@ -201,7 +201,9 @@ def fetch_video_stats(video_ids: List[str], api_key: str) -> Dict[str, Dict]:
             else:
                 print(f"오류: YouTube API 접근이 거부되었습니다.\n{resp.text}")
             sys.exit(1)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            print(f"오류: YouTube API 요청이 실패했습니다 (상태 코드 {resp.status_code}).\n{resp.text}")
+            sys.exit(1)
 
         data = resp.json()
         for item in data.get("items", []):
@@ -600,9 +602,10 @@ def upsert_sheet_rows(sheets_service, spreadsheet_id: str, rows: List[Dict], id_
             appended_vids.append(vid)
 
     if update_data:
+        # H열(드라이브 링크)이 자동으로 하이퍼링크 처리되도록 USER_ENTERED 사용.
         _execute_with_retry(sheets_service.spreadsheets().values().batchUpdate(
             spreadsheetId=spreadsheet_id,
-            body={"valueInputOption": "RAW", "data": update_data},
+            body={"valueInputOption": "USER_ENTERED", "data": update_data},
         ))
 
     if append_rows:
